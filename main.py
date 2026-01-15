@@ -941,10 +941,7 @@ async def on_message(message: discord.Message):
         return
     if message.channel and message.channel.id == MUTE_HINT_CHANNEL_ID:
         embed = discord.Embed(
-            description=(
-                "<:bell:1459329848161075200> Tired of __pings__? **Mute this channel**.\n"
-                "https://media1.tenor.com/m/j0RsjzrynisAAAAd/discord.gif"
-            ),
+            description="<:bell:1459329848161075200> Tired of __pings__? **Mute this channel**.",
             color=BOT_COLOR
         )
         embed.set_image(url="https://media1.tenor.com/m/j0RsjzrynisAAAAd/discord.gif")
