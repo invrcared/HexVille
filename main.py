@@ -1,12 +1,15 @@
 # merged_main_no_db.py
 import os
 import asyncio
-from datetime import datetime
+import io
+import re
+from datetime import datetime, timedelta
 import functools
 import json
 from typing import List, Dict, Any, Optional, Union
 
 import discord
+import aiohttp
 from discord.ext import commands
 from discord import app_commands, ui
 from dotenv import load_dotenv
@@ -33,7 +36,9 @@ WELCOME_CHANNEL_ID = 1459354203909783688
 VEHICLE_LOG_CHANNEL_ID = 1456813290381643806
 
 SUPPORT_CHANNEL_ID = 1429227915526017054
-MUTE_PROMPT_CHANNEL_ID = 1429220984988238007
+MUTE_HINT_CHANNEL_ID = 1429220984988238007
+MUTE_GIF_URL = "https://media.tenor.com/j0RsjzrynisAAAAd/discord.gif"
+STAFF_INFO_CHANNEL_ID = 1454611781887459409
 
 # Ticket system
 TICKET_CATEGORY_ID = 1459706908075233331
@@ -44,6 +49,11 @@ ADMIN_ROLE_ID = 1459341992525037835
 HIGHCOMMAND_ROLE_ID = 1450600601238114577
 OWNERSHIP_ROLE_ID = 1459333438871175200
 STAFF_TEAM_ROLE_ID = 1431352511931093052
+CONTROL_CENTER_ROLE_ID = 1459603730944098336
+DEVELOPER_USER_ID = 1239226604782354533
+INFRACT_1_ROLE_ID = 1457484364593238037
+INFRACT_2_ROLE_ID = 1457484411485556756
+INFRACT_3_ROLE_ID = 1457484458218356931
 
 # Session-related
 CIVILIAN_ROLE_ID = 1429222424393683074
@@ -86,6 +96,8 @@ session_log: Dict[int, Dict[str, Any]] = {}
 
 vehicle_store: Dict[int, List[Dict[str, Any]]] = {}
 unregister_uses: Dict[int, int] = {}
+_mute_gif_bytes: Optional[bytes] = None
+automod_settings: Dict[int, Dict[str, Any]] = {}
 
 PERSISTENCE_FILE = os.getenv("PERSISTENCE_FILE", "vehicle_store.json")
 
@@ -164,6 +176,15 @@ def is_staffing(interaction: discord.Interaction) -> bool:
 def is_ownership(interaction: discord.Interaction) -> bool:
     return has_role(interaction.user, OWNERSHIP_ROLE_ID)
 
+def is_developer(interaction: discord.Interaction) -> bool:
+    return interaction.user.id == DEVELOPER_USER_ID
+
+def is_ownership_plus(member: discord.Member) -> bool:
+    return has_role(member, OWNERSHIP_ROLE_ID) or has_role(member, ADMIN_ROLE_ID)
+
+def is_automod_exempt(member: discord.Member) -> bool:
+    return is_ownership_plus(member)
+
 # Generic helpers
 def remove_all_staff_roles(member: discord.Member):
     return [r for r in member.roles if r.id in STAFF_ROLE_IDS]
@@ -196,6 +217,37 @@ async def safe_dm(user: discord.Member, embed: discord.Embed):
         await user.send(embed=embed)
     except Exception:
         pass
+
+def get_automod_settings(guild_id: int) -> Dict[str, Any]:
+    defaults = {
+        "enabled": True,
+        "block_invites": True,
+        "block_links": False,
+        "block_words": [],
+        "max_mentions": 5,
+        "max_caps_percent": 70,
+        "max_caps_min": 12
+    }
+    settings = automod_settings.setdefault(guild_id, defaults.copy())
+    for k, v in defaults.items():
+        settings.setdefault(k, v)
+    return settings
+
+INVITE_RE = re.compile(r"(discord\.gg/|discord\.com/invite/)", re.IGNORECASE)
+LINK_RE = re.compile(r"https?://", re.IGNORECASE)
+
+def contains_invite(text: str) -> bool:
+    return bool(INVITE_RE.search(text))
+
+def contains_link(text: str) -> bool:
+    return bool(LINK_RE.search(text))
+
+def exceeds_caps(text: str, percent: int, min_len: int) -> bool:
+    letters = [c for c in text if c.isalpha()]
+    if len(letters) < min_len:
+        return False
+    upper = sum(1 for c in letters if c.isupper())
+    return (upper / len(letters) * 100) >= percent
 
 # ================== "DB" FUNCTIONS (IN-MEMORY) ==================
 def _insert_vehicle_local(user_id: int, vehicle: dict):
@@ -297,13 +349,119 @@ def build_panel_embed() -> discord.Embed:
     )
     return embed
 
-def build_mute_channel_embed() -> discord.Embed:
+def build_staff_info_embeds() -> List[discord.Embed]:
+    embeds: List[discord.Embed] = []
+
+    embed1 = discord.Embed(
+        title=f"{HEART} __**HexVille | Employee Information**__ {HEART}",
+        description=(
+            "Greetings, and congratulations on making it to the staff team of HexVille. "
+            "In this channel, every rule and piece of information regarding HexVille's staff team will be listed. "
+            "You are obligated to read and follow everything listed within this channel. "
+            "Failure to do so could lead to a possible warning or termination from the staff team.\n\n"
+            "__**Staff Rules & Regulations**__\n"
+            "**Rule 1: Sharing & Leaking Staff Assets**\n"
+            "Any form of sharing/leaking anything within the staff category will lead to a punishable offense, even something as small as a single message. "
+            "Termination will be issued if you're caught leaking anything under the staff category, including recorded voice audio from staff voice channels.\n\n"
+            "**Rule 2: Staff Behaviour & Representation**\n"
+            "Your behaviour should remain respectful toward others, including civilians and higher ranks. Do not instigate drama with civilians or fellow staff members. "
+            "Punishable offenses include disrespectful conduct such as death threats, encouraging self-harm, homophobia, and other unacceptable remarks.\n\n"
+            "**Rule 3: Staff Professionalism**\n"
+            "Know when to be professional and when it's appropriate to joke. In situations such as handling spam, managing report tickets, or overseeing an in-game staff scene, "
+            "you must remain professional. This includes proper grammar, a calm demeanor, and respectful interaction (see Rule 2). "
+            "Lack of professionalism can result in a warning or termination.\n\n"
+            "**Rule 4: Special Roleplay Events**\n"
+            "Special roleplays may not be hosted without permission from Supervisors+. "
+            "You must request permission from a member of the High Command team, who will handle permissions for special roleplays.\n\n"
+            "**Rule 5: Side Chatting & Bias**\n"
+            "Side-chatting in restricted channels may result in a warning and reflects poorly on your behaviour (refer to Staff Rules 2 & 3). "
+            "Bias, favoritism, or prioritizing friends/others is strictly prohibited in the HexVille staff team and may result in termination.\n\n"
+            "Common sense is key when serving as a staff member for HexVille. Beyond the listed rules, you are expected to understand what you are—and are not—allowed to do. "
+            "You may receive moderation for actions not listed here but deemed inappropriate."
+        ),
+        color=BOT_COLOR
+    )
+    embeds.append(embed1)
+
+    embed2 = discord.Embed(
+        title="__**Staff Channel Usage**__",
+        description=(
+            f"{DOT} #staff-announcements: All staff-related announcements.\n"
+            f"{DOT} #staff-information: Rules, formats, regulations, and guidelines.\n"
+            f"{DOT} #staff-chat: General staff discussions.\n"
+            f"{DOT} #staff-commands: Submit commands (excluding hosting).\n"
+            f"{DOT} #absence-request: Submit Leave of Absence requests; handled by High Ranking Team.\n"
+            f"{DOT} #punishment-requests: Request users to receive a Kick or Ban from the server.\n"
+            f"{DOT} #session-logs: Logs from hosting/attendance; reviewed by High Ranking Team.\n"
+            f"{DOT} #server-logs: Logs provided by Dyno Bot.\n\n"
+            "__**Activity & Quota Requirements**__\n"
+            f"{DOT} Moderation Training: Co-Host 4 sessions + Training Attendance.\n"
+            f"{DOT} Junior Staff: Host 6 sessions & 2 Co-Hosts.\n"
+            f"{DOT} Server Staff: Host 4 sessions & 2 Co-Hosts.\n"
+            f"{DOT} Senior Staff: Host 3 sessions & 2 Co-Hosts.\n"
+            f"{DOT} Lead Staff: Host 2 sessions & 2 Co-Hosts.\n"
+            f"{DOT} Management: Supervise 4 sessions & 2 Co-Hosts.\n\n"
+            "__**Important Note**__\n"
+            "Hosting = 1 hour minimum.\n"
+            "Attending = 30 minutes minimum.\n"
+            "Failure to meet these will result in an \"X\" on your session log(s)."
+        ),
+        color=BOT_COLOR
+    )
+    embeds.append(embed2)
+
+    embed3 = discord.Embed(
+        title="__**Session & Moderation Commands**__",
+        description=(
+            "__**Session Commands**__\n"
+            f"{DOT} /startup (reactions) - Starts a session; input reactions.\n"
+            f"{DOT} /earlyaccess (link) - Opens early access; input session link.\n"
+            f"{DOT} /release (link) (pt) (leo) (frp) (co-hosts) - Releases the session; insert session information.\n"
+            f"{DOT} /reinvites (link) (pt) (leo) (frp) (co-hosts) - Releases Re-Invites for the session; insert session information.\n"
+            f"{DOT} /cohost - Announces you will be Co-Hosting the current session.\n"
+            f"{DOT} /over (start) (end) (notes) - Announces session has concluded; insert information as appropriate.\n\n"
+            "__**Moderation Commands**__\n"
+            f"{DOT} /infract (user) (reason) (proof)\n\n"
+            "__**Staff Vehicles**__\n"
+            "Vehicle Details: 2023 Bullhorn Prancer Sheriff (Undercover)\n"
+            "Vehicle Color: #c19beb\n\n"
+            "This vehicle is to be used by all members within the Staff Department for patrolling, hosting, or co-hosting within a session.\n\n"
+            "__**HexVille**__"
+        ),
+        color=BOT_COLOR
+    )
+    embeds.append(embed3)
+
+    return embeds
+
+async def _get_mute_gif_bytes() -> Optional[bytes]:
+    global _mute_gif_bytes
+    if _mute_gif_bytes:
+        return _mute_gif_bytes
+    try:
+        timeout = aiohttp.ClientTimeout(total=10)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(MUTE_GIF_URL) as resp:
+                if resp.status != 200:
+                    return None
+                _mute_gif_bytes = await resp.read()
+                return _mute_gif_bytes
+    except Exception:
+        return None
+
+async def send_mute_prompt(channel: discord.abc.Messageable):
     embed = discord.Embed(
         description="<:bell:1459329848161075200> Tired of __pings__? **Mute this channel**.",
         color=BOT_COLOR
     )
-    embed.set_image(url="https://media.tenor.com/j0RsjzrynisAAAAd/discord.gif")
-    return embed
+    gif_bytes = await _get_mute_gif_bytes()
+    if gif_bytes:
+        file = discord.File(io.BytesIO(gif_bytes), filename="mute.gif")
+        embed.set_image(url="attachment://mute.gif")
+        await channel.send(embed=embed, file=file)
+        return
+    embed.set_image(url=MUTE_GIF_URL)
+    await channel.send(embed=embed)
 
 def build_ticket_embed(user: discord.Member, ticket_type: str, priority: str = "Normal") -> discord.Embed:
     return discord.Embed(
@@ -627,6 +785,215 @@ class PanelView(ui.View):
         super().__init__(timeout=None)
         self.add_item(TicketTypeSelect())
 
+class RoleEditModal(ui.Modal, title="Edit Control Role"):
+    role_name = ui.TextInput(label="Role name", required=False, max_length=100)
+    role_color = ui.TextInput(label="Role color (hex)", required=False, placeholder="#8fd6ff")
+
+    def __init__(self, role_id: int):
+        super().__init__()
+        self.role_id = role_id
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if not is_developer(interaction):
+            return await interaction.response.send_message("Unauthorized.", ephemeral=True)
+        role = interaction.guild.get_role(self.role_id) if interaction.guild else None
+        if not role:
+            return await interaction.response.send_message("Role not found.", ephemeral=True)
+        new_name = self.role_name.value.strip() if self.role_name.value else ""
+        color_text = self.role_color.value.strip() if self.role_color.value else ""
+        new_color = None
+        if color_text:
+            if color_text.startswith("#"):
+                color_text = color_text[1:]
+            if len(color_text) == 6:
+                try:
+                    new_color = discord.Color(int(color_text, 16))
+                except Exception:
+                    new_color = None
+        try:
+            await role.edit(
+                name=new_name or role.name,
+                color=new_color or role.color,
+                reason="Control center role edit"
+            )
+            await interaction.response.send_message("Role updated.", ephemeral=True)
+        except Exception:
+            await interaction.response.send_message("Failed to update role.", ephemeral=True)
+
+class AutomodPanelView(ui.View):
+    def __init__(self, guild_id: int):
+        super().__init__(timeout=None)
+        self.guild_id = guild_id
+
+    @ui.button(label="Toggle Enabled", style=discord.ButtonStyle.primary)
+    async def toggle_enabled(self, interaction: discord.Interaction, button: ui.Button):
+        if not is_ownership_plus(interaction.user):
+            return await interaction.response.send_message("Unauthorized.", ephemeral=True)
+        settings = get_automod_settings(interaction.guild.id)
+        settings["enabled"] = not settings["enabled"]
+        status = "enabled" if settings["enabled"] else "disabled"
+        await interaction.response.send_message(f"AutoMod {status}.", ephemeral=True)
+
+    @ui.button(label="Toggle Invites", style=discord.ButtonStyle.secondary)
+    async def toggle_invites(self, interaction: discord.Interaction, button: ui.Button):
+        if not is_ownership_plus(interaction.user):
+            return await interaction.response.send_message("Unauthorized.", ephemeral=True)
+        settings = get_automod_settings(interaction.guild.id)
+        settings["block_invites"] = not settings["block_invites"]
+        status = "on" if settings["block_invites"] else "off"
+        await interaction.response.send_message(f"Invite blocking {status}.", ephemeral=True)
+
+    @ui.button(label="Toggle Links", style=discord.ButtonStyle.secondary)
+    async def toggle_links(self, interaction: discord.Interaction, button: ui.Button):
+        if not is_ownership_plus(interaction.user):
+            return await interaction.response.send_message("Unauthorized.", ephemeral=True)
+        settings = get_automod_settings(interaction.guild.id)
+        settings["block_links"] = not settings["block_links"]
+        status = "on" if settings["block_links"] else "off"
+        await interaction.response.send_message(f"Link blocking {status}.", ephemeral=True)
+
+    @ui.button(label="Edit Blocked Words", style=discord.ButtonStyle.primary)
+    async def edit_words(self, interaction: discord.Interaction, button: ui.Button):
+        if not is_ownership_plus(interaction.user):
+            return await interaction.response.send_message("Unauthorized.", ephemeral=True)
+        await interaction.response.send_modal(AutomodWordsModal())
+
+    @ui.button(label="Edit Limits", style=discord.ButtonStyle.primary)
+    async def edit_limits(self, interaction: discord.Interaction, button: ui.Button):
+        if not is_ownership_plus(interaction.user):
+            return await interaction.response.send_message("Unauthorized.", ephemeral=True)
+        await interaction.response.send_modal(AutomodLimitsModal())
+
+class AutomodWordsModal(ui.Modal, title="AutoMod Blocked Words"):
+    words = ui.TextInput(label="Words (comma-separated)", required=False, max_length=400, placeholder="word1, word2")
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if not is_ownership_plus(interaction.user):
+            return await interaction.response.send_message("Unauthorized.", ephemeral=True)
+        settings = get_automod_settings(interaction.guild.id)
+        raw = self.words.value.strip()
+        settings["block_words"] = [w.strip().lower() for w in raw.split(",") if w.strip()] if raw else []
+        await interaction.response.send_message("Blocked words updated.", ephemeral=True)
+
+class AutomodLimitsModal(ui.Modal, title="AutoMod Limits"):
+    max_mentions = ui.TextInput(label="Max mentions", required=False, placeholder="5")
+    max_caps_percent = ui.TextInput(label="Max caps percent", required=False, placeholder="70")
+    max_caps_min = ui.TextInput(label="Min letters for caps check", required=False, placeholder="12")
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if not is_ownership_plus(interaction.user):
+            return await interaction.response.send_message("Unauthorized.", ephemeral=True)
+        settings = get_automod_settings(interaction.guild.id)
+        if self.max_mentions.value.strip().isdigit():
+            settings["max_mentions"] = int(self.max_mentions.value.strip())
+        if self.max_caps_percent.value.strip().isdigit():
+            settings["max_caps_percent"] = int(self.max_caps_percent.value.strip())
+        if self.max_caps_min.value.strip().isdigit():
+            settings["max_caps_min"] = int(self.max_caps_min.value.strip())
+        await interaction.response.send_message("Limits updated.", ephemeral=True)
+
+class SupportLinkView(ui.View):
+    def __init__(self, guild_id: int):
+        super().__init__(timeout=None)
+        self.add_item(
+            ui.Button(
+                label="Support",
+                style=discord.ButtonStyle.link,
+                url=f"https://discord.com/channels/{guild_id}/{SUPPORT_CHANNEL_ID}"
+            )
+        )
+
+class StaffInfoSelect(ui.Select):
+    def __init__(self):
+        options = [
+            discord.SelectOption(label="How to host a session?", description="Coming soon"),
+            discord.SelectOption(label="How to handle a ticket?", description="Coming soon")
+        ]
+        super().__init__(placeholder="Select an option...", min_values=1, max_values=1, options=options)
+
+    async def callback(self, interaction: discord.Interaction):
+        await interaction.response.send_message("Coming soon.", ephemeral=True)
+
+class ControlPanelView(ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @ui.button(label="Send Staff Information Embed", style=discord.ButtonStyle.primary)
+    async def send_staff_info(self, interaction: discord.Interaction, button: ui.Button):
+        if not is_developer(interaction):
+            return await interaction.response.send_message("Unauthorized.", ephemeral=True)
+        channel = interaction.guild.get_channel(STAFF_INFO_CHANNEL_ID) if interaction.guild else None
+        if not channel:
+            return await interaction.response.send_message("Staff info channel not found.", ephemeral=True)
+        try:
+            embeds = build_staff_info_embeds()
+            await channel.send(embed=embeds[0], view=StaffInfoView())
+            for embed in embeds[1:]:
+                await channel.send(embed=embed)
+            await interaction.response.send_message("Staff information posted.", ephemeral=True)
+        except Exception:
+            await interaction.response.send_message("Failed to post staff information.", ephemeral=True)
+
+    @ui.button(label="Grant Role", style=discord.ButtonStyle.success)
+    async def grant_role(self, interaction: discord.Interaction, button: ui.Button):
+        if not is_developer(interaction):
+            return await interaction.response.send_message("Unauthorized.", ephemeral=True)
+        role = interaction.guild.get_role(CONTROL_CENTER_ROLE_ID) if interaction.guild else None
+        if not role:
+            return await interaction.response.send_message("Role not found.", ephemeral=True)
+        member = interaction.guild.get_member(interaction.user.id) if interaction.guild else None
+        if not member:
+            return await interaction.response.send_message("Member not found.", ephemeral=True)
+        try:
+            await member.add_roles(role, reason="Control panel grant")
+            await interaction.response.send_message("Role granted.", ephemeral=True)
+        except Exception:
+            await interaction.response.send_message("Failed to grant role.", ephemeral=True)
+
+    @ui.button(label="Remove Role", style=discord.ButtonStyle.danger)
+    async def remove_role(self, interaction: discord.Interaction, button: ui.Button):
+        if not is_developer(interaction):
+            return await interaction.response.send_message("Unauthorized.", ephemeral=True)
+        role = interaction.guild.get_role(CONTROL_CENTER_ROLE_ID) if interaction.guild else None
+        if not role:
+            return await interaction.response.send_message("Role not found.", ephemeral=True)
+        member = interaction.guild.get_member(interaction.user.id) if interaction.guild else None
+        if not member:
+            return await interaction.response.send_message("Member not found.", ephemeral=True)
+        try:
+            await member.remove_roles(role, reason="Control panel remove")
+            await interaction.response.send_message("Role removed.", ephemeral=True)
+        except Exception:
+            await interaction.response.send_message("Failed to remove role.", ephemeral=True)
+
+    @ui.button(label="Edit Role Name/Color", style=discord.ButtonStyle.primary)
+    async def edit_role(self, interaction: discord.Interaction, button: ui.Button):
+        if not is_developer(interaction):
+            return await interaction.response.send_message("Unauthorized.", ephemeral=True)
+        role = interaction.guild.get_role(CONTROL_CENTER_ROLE_ID) if interaction.guild else None
+        if not role:
+            return await interaction.response.send_message("Role not found.", ephemeral=True)
+        await interaction.response.send_modal(RoleEditModal(role_id=role.id))
+
+    @ui.button(label="Toggle Hoist", style=discord.ButtonStyle.secondary)
+    async def toggle_hoist(self, interaction: discord.Interaction, button: ui.Button):
+        if not is_developer(interaction):
+            return await interaction.response.send_message("Unauthorized.", ephemeral=True)
+        role = interaction.guild.get_role(CONTROL_CENTER_ROLE_ID) if interaction.guild else None
+        if not role:
+            return await interaction.response.send_message("Role not found.", ephemeral=True)
+        try:
+            await role.edit(hoist=not role.hoist, reason="Control panel hoist toggle")
+            status = "enabled" if role.hoist else "disabled"
+            await interaction.response.send_message(f"Hoist {status}.", ephemeral=True)
+        except Exception:
+            await interaction.response.send_message("Failed to toggle hoist.", ephemeral=True)
+
+class StaffInfoView(ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+        self.add_item(StaffInfoSelect())
+
 @bot.tree.command(name="panel", description="Send the HexVille support panel")
 async def panel(interaction: discord.Interaction):
     if not is_staff(interaction):
@@ -638,6 +1005,187 @@ async def panel(interaction: discord.Interaction):
     except Exception as e:
         await interaction.followup.send(f"Failed to post panel: {e}", ephemeral=True)
 
+@bot.tree.command(name="control-panel", description="Developer-only control panel")
+async def control_panel(interaction: discord.Interaction):
+    if not is_developer(interaction):
+        return await interaction.response.send_message("Unauthorized.", ephemeral=True)
+    await interaction.response.defer(ephemeral=True)
+    embed = discord.Embed(
+        title="__**HexVille | Control Panel**__",
+        description=(
+            f"{BLUEARROW} Use the button below to post the staff information embed set.\n"
+            f"{BLUEARROW} Manage the control role with the buttons."
+        ),
+        color=BOT_COLOR
+    )
+    try:
+        await interaction.channel.send(embed=embed, view=ControlPanelView())
+        await interaction.followup.send("Control panel posted.", ephemeral=True)
+    except Exception as e:
+        await interaction.followup.send(f"Failed to post control panel: {e}", ephemeral=True)
+
+@bot.tree.command(name="automodpanel", description="Configure AutoMod (Ownership+)")
+async def automodpanel(interaction: discord.Interaction):
+    if not is_ownership_plus(interaction.user):
+        return await interaction.response.send_message("Unauthorized.", ephemeral=True)
+    await interaction.response.defer(ephemeral=True)
+    settings = get_automod_settings(interaction.guild.id)
+    status = "Enabled" if settings["enabled"] else "Disabled"
+    invite_status = "On" if settings["block_invites"] else "Off"
+    link_status = "On" if settings["block_links"] else "Off"
+    words = ", ".join(settings["block_words"]) or "None"
+    embed = discord.Embed(
+        title="__**HexVille | AutoMod Panel**__",
+        description=(
+            f"{BLUEARROW} **Status:** {status}\n"
+            f"{BLUEARROW} **Invite Blocking:** {invite_status}\n"
+            f"{BLUEARROW} **Link Blocking:** {link_status}\n"
+            f"{BLUEARROW} **Max Mentions:** {settings['max_mentions']}\n"
+            f"{BLUEARROW} **Caps Limit:** {settings['max_caps_percent']}% (min {settings['max_caps_min']} letters)\n"
+            f"{BLUEARROW} **Blocked Words:** {words}"
+        ),
+        color=BOT_COLOR
+    )
+    try:
+        await interaction.channel.send(embed=embed, view=AutomodPanelView(interaction.guild.id))
+        await interaction.followup.send("AutoMod panel posted.", ephemeral=True)
+    except Exception as e:
+        await interaction.followup.send(f"Failed to post AutoMod panel: {e}", ephemeral=True)
+
+# ================== MODERATION COMMANDS (Ownership+) ==================
+@bot.tree.command(name="ban", description="Ban a member (Ownership+)")
+@app_commands.describe(member="Member to ban", reason="Reason for ban", delete_message_days="Delete days of messages (0-7)")
+async def ban(interaction: discord.Interaction, member: discord.Member, reason: Optional[str] = None, delete_message_days: int = 0):
+    if not is_ownership_plus(interaction.user):
+        return await interaction.response.send_message("Unauthorized.", ephemeral=True)
+    await interaction.response.defer(ephemeral=True)
+    if delete_message_days < 0 or delete_message_days > 7:
+        return await interaction.followup.send("delete_message_days must be between 0 and 7.", ephemeral=True)
+    try:
+        await member.ban(reason=reason or "No reason provided", delete_message_days=delete_message_days)
+        embed = discord.Embed(
+            title="dYZо Ban Issued",
+            description=(
+                f"{BLUEARROW} **User:** {member.mention} ({member.id})\n"
+                f"{BLUEARROW} **By:** {interaction.user.mention}\n"
+                f"{BLUEARROW} **Reason:** {reason or 'No reason provided'}"
+            ),
+            color=BOT_COLOR,
+            timestamp=datetime.utcnow()
+        )
+        await log_action(interaction.guild, embed)
+        await interaction.followup.send("User banned.", ephemeral=True)
+    except Exception:
+        await interaction.followup.send("Failed to ban user.", ephemeral=True)
+
+@bot.tree.command(name="kick", description="Kick a member (Ownership+)")
+@app_commands.describe(member="Member to kick", reason="Reason for kick")
+async def kick(interaction: discord.Interaction, member: discord.Member, reason: Optional[str] = None):
+    if not is_ownership_plus(interaction.user):
+        return await interaction.response.send_message("Unauthorized.", ephemeral=True)
+    await interaction.response.defer(ephemeral=True)
+    try:
+        await member.kick(reason=reason or "No reason provided")
+        embed = discord.Embed(
+            title="dYZо Kick Issued",
+            description=(
+                f"{BLUEARROW} **User:** {member.mention} ({member.id})\n"
+                f"{BLUEARROW} **By:** {interaction.user.mention}\n"
+                f"{BLUEARROW} **Reason:** {reason or 'No reason provided'}"
+            ),
+            color=BOT_COLOR,
+            timestamp=datetime.utcnow()
+        )
+        await log_action(interaction.guild, embed)
+        await interaction.followup.send("User kicked.", ephemeral=True)
+    except Exception:
+        await interaction.followup.send("Failed to kick user.", ephemeral=True)
+
+@bot.tree.command(name="mute", description="Timeout a member (Ownership+)")
+@app_commands.describe(member="Member to mute", minutes="Duration in minutes", reason="Reason for mute")
+async def mute(interaction: discord.Interaction, member: discord.Member, minutes: int, reason: Optional[str] = None):
+    if not is_ownership_plus(interaction.user):
+        return await interaction.response.send_message("Unauthorized.", ephemeral=True)
+    await interaction.response.defer(ephemeral=True)
+    if minutes <= 0:
+        return await interaction.followup.send("Minutes must be greater than 0.", ephemeral=True)
+    try:
+        until = datetime.utcnow() + timedelta(minutes=minutes)
+        await member.timeout(until, reason=reason or "No reason provided")
+        embed = discord.Embed(
+            title="dYZо Mute Issued",
+            description=(
+                f"{BLUEARROW} **User:** {member.mention} ({member.id})\n"
+                f"{BLUEARROW} **By:** {interaction.user.mention}\n"
+                f"{BLUEARROW} **Duration:** {minutes} minutes\n"
+                f"{BLUEARROW} **Reason:** {reason or 'No reason provided'}"
+            ),
+            color=BOT_COLOR,
+            timestamp=datetime.utcnow()
+        )
+        await log_action(interaction.guild, embed)
+        await interaction.followup.send("User muted.", ephemeral=True)
+    except Exception:
+        await interaction.followup.send("Failed to mute user.", ephemeral=True)
+
+@bot.tree.command(name="infract", description="Issue a session warning (Staff+)")
+@app_commands.describe(user="User to infract", reason="Reason for infraction", proof="Proof (link or details)")
+async def infract(interaction: discord.Interaction, user: discord.Member, reason: str, proof: str):
+    if not is_staff(interaction):
+        return await interaction.response.send_message("Unauthorized.", ephemeral=True)
+    await interaction.response.defer(ephemeral=True)
+
+    guild = interaction.guild
+    if not guild:
+        return await interaction.followup.send("Guild not found.", ephemeral=True)
+
+    role1 = guild.get_role(INFRACT_1_ROLE_ID)
+    role2 = guild.get_role(INFRACT_2_ROLE_ID)
+    role3 = guild.get_role(INFRACT_3_ROLE_ID)
+    if not role1 or not role2 or not role3:
+        return await interaction.followup.send("Infraction roles not found.", ephemeral=True)
+
+    user_roles = {r.id for r in user.roles}
+    target_role = None
+    level = 1
+    if INFRACT_1_ROLE_ID in user_roles and INFRACT_2_ROLE_ID not in user_roles and INFRACT_3_ROLE_ID not in user_roles:
+        target_role = role2
+        level = 2
+    elif INFRACT_2_ROLE_ID in user_roles and INFRACT_3_ROLE_ID not in user_roles:
+        target_role = role3
+        level = 3
+    elif INFRACT_3_ROLE_ID in user_roles:
+        target_role = role3
+        level = 3
+    else:
+        target_role = role1
+        level = 1
+
+    try:
+        if target_role and target_role not in user.roles:
+            await user.add_roles(target_role, reason=f"Session warning {level}")
+    except Exception:
+        return await interaction.followup.send("Failed to apply infraction role.", ephemeral=True)
+
+    embed = discord.Embed(
+        title=f"{BLUEARROW} Session Warning {level}",
+        description=(
+            f"{BLUEARROW} **User:** {user.mention} ({user.id})\n"
+            f"{BLUEARROW} **Issued By:** {interaction.user.mention}\n"
+            f"{BLUEARROW} **Reason:** {reason}\n"
+            f"{BLUEARROW} **Proof:** {proof}"
+        ),
+        color=BOT_COLOR,
+        timestamp=datetime.utcnow()
+    )
+    await safe_dm(user, embed)
+
+    try:
+        await log_action(guild, embed)
+    except Exception:
+        pass
+
+    await interaction.followup.send(f"Issued Session Warning {level}.", ephemeral=True)
 @bot.tree.command(name="close", description="Close the current ticket")
 async def close(interaction: discord.Interaction):
     channel = interaction.channel
@@ -942,7 +1490,74 @@ async def comingsoon(interaction: discord.Interaction):
     await interaction.channel.send(embed=embed)
     await interaction.followup.send("Shown coming soon.", ephemeral=True)
 
+@bot.tree.command(name="prequirements", description="Show partnership requirements")
+async def prequirements(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+    embed = discord.Embed(
+        description=(
+            "<:exclamation:1459330299052949586> __**Partnership Requirements**__\n\n"
+            f"{BLUEARROW}30 members minimum — **to complete a partnership.**\n"
+            f"{BLUEARROW}30-100 members — **no ping**\n"
+            f"{BLUEARROW}100-250 members — **here ping**\n"
+            f"{BLUEARROW}250 members — **everyone ping**\n\n"
+            f"-# If you are eligble for partnerships, and you are interested, please open a ticket within the <#{SUPPORT_CHANNEL_ID}> channel!"
+        ),
+        color=BOT_COLOR
+    )
+    await interaction.channel.send(embed=embed, view=SupportLinkView(interaction.guild.id))
+    await interaction.followup.send("Partnership requirements posted.", ephemeral=True)
+
 # ================== START BOT ==================
+@bot.event
+async def on_message(message: discord.Message):
+    if message.author.bot:
+        return
+    if message.guild and isinstance(message.author, discord.Member):
+        settings = get_automod_settings(message.guild.id)
+        if settings["enabled"] and not is_automod_exempt(message.author):
+            content = message.content or ""
+            should_delete = False
+            reason = ""
+            if settings["block_invites"] and contains_invite(content):
+                should_delete = True
+                reason = "Invite links are not allowed."
+            elif settings["block_links"] and contains_link(content):
+                should_delete = True
+                reason = "Links are not allowed."
+            elif settings["block_words"]:
+                lowered = content.lower()
+                if any(w in lowered for w in settings["block_words"]):
+                    should_delete = True
+                    reason = "That word is not allowed."
+            elif exceeds_caps(content, settings["max_caps_percent"], settings["max_caps_min"]):
+                should_delete = True
+                reason = "Please avoid excessive caps."
+            else:
+                mention_count = len(message.mentions) + len(message.role_mentions)
+                if message.mention_everyone:
+                    mention_count += 5
+                if settings["max_mentions"] and mention_count > settings["max_mentions"]:
+                    should_delete = True
+                    reason = "Too many mentions."
+            if should_delete:
+                try:
+                    await message.delete()
+                except Exception:
+                    pass
+                try:
+                    warn = await message.channel.send(f"{message.author.mention} {reason}")
+                    await asyncio.sleep(5)
+                    await warn.delete()
+                except Exception:
+                    pass
+                return
+    if message.channel and message.channel.id == MUTE_HINT_CHANNEL_ID:
+        try:
+            await send_mute_prompt(message.channel)
+        except Exception:
+            pass
+    await bot.process_commands(message)
+
 @bot.event
 async def on_ready():
     print(f"Logged in as {bot.user} (ID: {bot.user.id})")
@@ -954,17 +1569,6 @@ async def on_ready():
             await bot.tree.sync()
     except Exception:
         pass
-
-@bot.event
-async def on_message(message: discord.Message):
-    if message.author.bot:
-        return
-    if message.channel.id == MUTE_PROMPT_CHANNEL_ID:
-        try:
-            await message.channel.send(embed=build_mute_channel_embed())
-        except Exception:
-            pass
-    await bot.process_commands(message)
 
 if __name__ == "__main__":
     bot.run(TOKEN)
