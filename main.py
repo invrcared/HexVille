@@ -33,7 +33,7 @@ WELCOME_CHANNEL_ID = 1459354203909783688
 VEHICLE_LOG_CHANNEL_ID = 1456813290381643806
 
 SUPPORT_CHANNEL_ID = 1429227915526017054
-MUTE_HINT_CHANNEL_ID = 1429220984988238007
+MUTE_PROMPT_CHANNEL_ID = 1429220984988238007
 
 # Ticket system
 TICKET_CATEGORY_ID = 1459706908075233331
@@ -295,6 +295,14 @@ def build_panel_embed() -> discord.Embed:
         ),
         color=BOT_COLOR
     )
+    return embed
+
+def build_mute_channel_embed() -> discord.Embed:
+    embed = discord.Embed(
+        description="<:bell:1459329848161075200> Tired of __pings__? **Mute this channel**.",
+        color=BOT_COLOR
+    )
+    embed.set_image(url="https://media.tenor.com/j0RsjzrynisAAAAd/discord.gif")
     return embed
 
 def build_ticket_embed(user: discord.Member, ticket_type: str, priority: str = "Normal") -> discord.Embed:
@@ -936,19 +944,6 @@ async def comingsoon(interaction: discord.Interaction):
 
 # ================== START BOT ==================
 @bot.event
-async def on_message(message: discord.Message):
-    if message.author.bot:
-        return
-    if message.channel and message.channel.id == MUTE_HINT_CHANNEL_ID:
-        embed = discord.Embed(
-            description="<:bell:1459329848161075200> Tired of __pings__? **Mute this channel**.",
-            color=BOT_COLOR
-        )
-        embed.set_image(url="https://media1.tenor.com/m/j0RsjzrynisAAAAd/discord.gif")
-        await message.channel.send(embed=embed)
-    await bot.process_commands(message)
-
-@bot.event
 async def on_ready():
     print(f"Logged in as {bot.user} (ID: {bot.user.id})")
     try:
@@ -959,6 +954,17 @@ async def on_ready():
             await bot.tree.sync()
     except Exception:
         pass
+
+@bot.event
+async def on_message(message: discord.Message):
+    if message.author.bot:
+        return
+    if message.channel.id == MUTE_PROMPT_CHANNEL_ID:
+        try:
+            await message.channel.send(embed=build_mute_channel_embed())
+        except Exception:
+            pass
+    await bot.process_commands(message)
 
 if __name__ == "__main__":
     bot.run(TOKEN)
